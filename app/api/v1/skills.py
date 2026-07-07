@@ -8,10 +8,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import PaginationParams, get_db
 from app.api.v1._presenters import skill_to_read_model
 from app.core.exceptions import ConflictError
+from app.knowledge.service import KnowledgeSkillService
 from app.repositories.skill_repository import SkillRepository
 from app.schemas.agent import AgentRead
 from app.schemas.common import PaginatedResponse
-from app.schemas.skill import AgentSkillAssign, SkillCreate, SkillRead, SkillUpdate
+from app.schemas.skill import (
+    AgentSkillAssign,
+    SkillCreate,
+    SkillRead,
+    SkillTestRequest,
+    SkillTestResponse,
+    SkillUpdate,
+)
 
 router = APIRouter(prefix="/skills", tags=["Skills"])
 
@@ -105,3 +113,34 @@ async def unassign_skill_from_agent(payload: AgentSkillAssign, db: AsyncSession 
     repo = SkillRepository(db)
     await repo.unassign_from_agent(payload.agent_id, payload.skill_id)
     return {"agent_id": str(payload.agent_id), "skill_id": str(payload.skill_id), "assigned": False}
+
+
+@router.post("/{skill_id}/test", response_model=SkillTestResponse)
+async def test_skill(skill_id: UUID, payload: SkillTestRequest, db: AsyncSession = Depends(get_db)):
+    """Runs a live invocation of a Skill's Executor and returns the
+    result, without going through a full Agent/chat turn - lets the
+    (future) Admin UI validate a Skill's configuration before assigning
+    it to an Agent.
+
+    Currently only meaningful for skill_type=KNOWLEDGE (runs a real
+    search against the configured Knowledge Platform instance and
+    returns the retrieved chunks as rendered context). Any inbound
+    Authorization / X-API-Key header is forwarded unchanged to the
+    Knowledge Platform, exactly like a real chat turn would - this
+    endpoint performs no authentication of its own.
+    """
+    repo = SkillRepository(db)
+    skill = await repo.get_or_404(skill_id)
+
+    knowledge_service = KnowledgeSkillService(db)
+    result = await knowledge_service.execute_by_skill(skill, payload.query)
+
+    return SkillTestResponse(
+        skill_id=skill.id,
+        skill_code=skill.code,
+        ok=result.ok,
+        context=result.context or None,
+        chunk_count=result.chunk_count,
+        latency_ms=result.latency_ms,
+        error=result.error,
+    )

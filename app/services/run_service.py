@@ -56,6 +56,20 @@ class RunTrackingService:
         await self.emit_event(run.id, EventType.error, {"error": error_message})
         return run
 
+    async def mark_cancelled(self, run: AgentRun, output: str = "", *, reason: str = "Cancelled by user") -> AgentRun:
+        """Marks a run stopped mid-flight via POST /runs/{id}/cancel.
+        `output` is whatever partial assistant content had already been
+        produced before the cancellation was noticed - persisted so the
+        partial answer isn't lost, distinct from `error_message`, which
+        records why the run stopped rather than what it produced."""
+        run.status = RunStatus.cancelled
+        run.output = output or None
+        run.error_message = reason
+        run.finished_at = datetime.now(timezone.utc)
+        await self.session.flush()
+        await self.emit_event(run.id, EventType.run_cancelled, {"reason": reason, "output_length": len(output)})
+        return run
+
     async def emit_event(self, run_id: uuid.UUID, event_type: EventType, payload: dict) -> AgentEvent:
         event = await self.event_repo.create(run_id=run_id, event_type=event_type, payload=payload)
         logger.info("agent_event_emitted", run_id=str(run_id), event_type=event_type.value)

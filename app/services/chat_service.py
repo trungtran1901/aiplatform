@@ -19,6 +19,16 @@ streaming path and just aggregates the result, so that tool-call events
 are always captured into agent_events regardless of which endpoint the
 caller used - only the HTTP response shape differs between the two
 endpoints, not the underlying execution or observability.
+
+CANCELLATION: POST /api/v1/chat/stream is the one execution path where a
+user can realistically stop an in-flight run mid-way, the same way a
+"stop generating" button works in a chat UI - see
+app/core/run_control.py and POST /api/v1/runs/{id}/cancel. Each branch
+below checks `is_cancelled(run.id)` once per streamed Agno event; on a
+hit it closes the underlying stream (releasing its MCP session via the
+same async-generator cleanup path a normal completion takes), marks the
+run CANCELLED with whatever partial content had already been produced,
+and stops - no further events are yielded for that run.
 """
 from __future__ import annotations
 
@@ -30,6 +40,7 @@ from app.agno_runtime.agui_interface import AgnoAguiInterface, _merge_text_chunk
 from app.agno_runtime.engine import AgnoRuntimeEngine, ResolvedRuntimeContext, ResolvedTeamContext, ResolvedRootContext
 from app.core.exceptions import NotFoundError, RuntimeExecutionError
 from app.core.logging import get_logger
+from app.core.run_control import clear_cancel, is_cancelled
 from app.models.run import EventType
 from app.models.session import MessageRole
 from app.repositories.session_repository import ChatMessageRepository, ChatSessionRepository
@@ -260,6 +271,44 @@ class ChatService:
         # Fallback
         raise RuntimeExecutionError("Unable to resolve runtime context for chat request")
 
+    async def _handle_cancellation(
+        self,
+        run,
+        stream,
+        chat_session_id,
+        full_content_parts: list[str],
+    ) -> dict[str, Any]:
+        """Shared cancellation-noticed path for every branch below:
+        closes the underlying Agno stream (triggering its normal
+        async-generator cleanup - the same `finally`/`async with` exit
+        that a completed or errored run takes, so the MCP session is
+        released the same way either way), persists whatever partial
+        assistant content had already streamed in as the ChatMessage,
+        marks the run CANCELLED, and clears the Redis signal now that
+        it's been acted on."""
+        await stream.aclose()
+
+        partial_output = self._merge_content_parts(full_content_parts)
+        if partial_output:
+            await self.message_repo.create(
+                session_id=chat_session_id,
+                run_id=run.id,
+                role=MessageRole.assistant,
+                content=partial_output,
+            )
+        await self.run_service.mark_cancelled(run, partial_output)
+        await self.session.commit()
+        await clear_cancel(str(run.id))
+
+        logger.info("agent_run_cancelled", run_id=str(run.id))
+
+        return {
+            "event_type": "run_cancelled",
+            "run_id": run.id,
+            "session_id": chat_session_id,
+            "data": {"message": "Run cancelled by user", "partial_message": partial_output},
+        }
+
     async def handle_chat_stream(self, request: ChatRequest) -> AsyncIterator[dict[str, Any]]:
         """Streaming chat turn. Used by POST /api/v1/chat/stream (SSE)."""
         ctx = await self.engine.resolve_dispatch_context(request.agentOs, request.team)
@@ -291,13 +340,18 @@ class ChatService:
             }
 
             full_content_parts: list[str] = []
+            stream = self.engine.run_stream(
+                ctx,
+                request.message,
+                session_id=str(chat_session.id),
+                user_id=request.user_id,
+            )
             try:
-                async for event in self.engine.run_stream(
-                    ctx,
-                    request.message,
-                    session_id=str(chat_session.id),
-                    user_id=request.user_id,
-                ):
+                async for event in stream:
+                    if await is_cancelled(str(run.id)):
+                        yield await self._handle_cancellation(run, stream, chat_session.id, full_content_parts)
+                        return
+
                     event_type = _safe_event_type(event["event_type"])
                     await self.run_service.emit_event(run.id, event_type, event["payload"])
                     await self.session.commit()
@@ -376,13 +430,18 @@ class ChatService:
             }
 
             full_content_parts: list[str] = []
+            stream = self.engine.run_team_stream(
+                ctx,
+                request.message,
+                session_id=str(chat_session.id),
+                user_id=request.user_id,
+            )
             try:
-                async for event in self.engine.run_team_stream(
-                    ctx,
-                    request.message,
-                    session_id=str(chat_session.id),
-                    user_id=request.user_id,
-                ):
+                async for event in stream:
+                    if await is_cancelled(str(run.id)):
+                        yield await self._handle_cancellation(run, stream, chat_session.id, full_content_parts)
+                        return
+
                     event_type = _safe_event_type(event["event_type"])
                     await self.run_service.emit_event(run.id, event_type, event["payload"])
                     await self.session.commit()
@@ -462,13 +521,18 @@ class ChatService:
             }
 
             full_content_parts: list[str] = []
+            stream = self.engine.run_root_stream(
+                ctx,
+                request.message,
+                session_id=str(chat_session.id),
+                user_id=request.user_id,
+            )
             try:
-                async for event in self.engine.run_root_stream(
-                    ctx,
-                    request.message,
-                    session_id=str(chat_session.id),
-                    user_id=request.user_id,
-                ):
+                async for event in stream:
+                    if await is_cancelled(str(run.id)):
+                        yield await self._handle_cancellation(run, stream, chat_session.id, full_content_parts)
+                        return
+
                     event_type = _safe_event_type(event["event_type"])
                     await self.run_service.emit_event(run.id, event_type, event["payload"])
                     await self.session.commit()

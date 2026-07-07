@@ -19,6 +19,7 @@ class RunStatus(str, Enum):
     waiting = "waiting"
     completed = "completed"
     failed = "failed"
+    cancelled = "cancelled"
 
 
 class EventType(str, Enum):
@@ -32,6 +33,7 @@ class EventType(str, Enum):
     memory_update_started = "memory_update_started"
     memory_update_completed = "memory_update_completed"
     error = "error"
+    run_cancelled = "run_cancelled"
 
 
 class AgentRun(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -44,7 +46,10 @@ class AgentRun(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         UUID(as_uuid=True), ForeignKey("agents.id", ondelete="CASCADE"), nullable=False, index=True
     )
     status: Mapped[RunStatus] = mapped_column(
-        SAEnum(RunStatus, name="run_status"), default=RunStatus.pending, nullable=False, index=True
+        SAEnum(RunStatus, name="run_status", values_callable=lambda obj: [e.value for e in obj]),
+        default=RunStatus.pending,
+        nullable=False,
+        index=True,
     )
     input: Mapped[str] = mapped_column(nullable=False)
     output: Mapped[str | None] = mapped_column(nullable=True)
@@ -67,7 +72,9 @@ class AgentEvent(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         UUID(as_uuid=True), ForeignKey("agent_runs.id", ondelete="CASCADE"), nullable=False, index=True
     )
     event_type: Mapped[EventType] = mapped_column(
-        SAEnum(EventType, name="event_type"), nullable=False, index=True
+        SAEnum(EventType, name="event_type", values_callable=lambda obj: [e.value for e in obj]),
+        nullable=False,
+        index=True,
     )
     payload: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 

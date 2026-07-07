@@ -12,6 +12,8 @@ It implements the runtime flow described in the architecture:
         |
     Resolve Effective Capabilities (intersection)
         |
+    Execute Knowledge Skills assigned to the Agent, fold results into prompt
+        |
     Open MCP session scoped to effective capabilities (MCP Tool Adapter)
         |
     Construct Agno Agent (model, prompt, live MCPTools)
@@ -27,7 +29,10 @@ It implements the runtime flow described in the architecture:
 No business logic about *what* a tool does lives here - this module only
 wires metadata into Agno's constructs. It also never makes an
 authorization decision; all it does is forward whichever capabilities
-were already determined (by capability_service) to be in scope.
+were already determined (by capability_service) to be in scope, and
+forward whichever auth headers were already captured (by auth_context)
+to the Knowledge Platform via KnowledgeSkillService, exactly the way it
+forwards them to MCP Gateway.
 
 MCP-over-SSE note: the MCP session (a live connection to MCP Gateway's
 MCP server) must stay open for the entire duration of one agent run,
@@ -35,6 +40,15 @@ since Agno calls tools on it lazily as the LLM decides to use them. It
 is opened right before `arun()` and closed right after, in `run()` /
 `run_stream()` below - never held open across chat turns, keeping the
 runtime stateless between requests.
+
+Knowledge Skill note: unlike MCP tools (which the LLM decides whether to
+call), Knowledge Skill retrieval happens eagerly, once per run, before
+the Agno Agent/Team is even constructed - the retrieved context is
+folded directly into the Agent's `instructions` as a "Knowledge Context"
+section (see app/knowledge/mapper.py::render_context), not exposed as a
+callable tool. This matches the spec's "the Agent should not know how
+retrieval is performed" requirement: from the Agent's point of view,
+relevant knowledge is simply already part of its instructions.
 
 Hierarchical dispatch (AgentOS -> Team -> Agent), added on top of the
 flow above:
@@ -79,11 +93,12 @@ from agno.agent import Agent as AgnoAgent
 from agno.memory.v2.memory import Memory
 from agno.team import Team as AgnoTeam
 
-from app.agno_runtime.agent_storage import build_agent_storage
+from app.agno_runtime.agent_storage import build_agent_storage, build_team_storage
 from app.agno_runtime.memory_db import PlatformMemoryDb
 from app.agno_runtime.tool_adapter import ToolCatalogBuilder
 from app.core.exceptions import RuntimeExecutionError
 from app.core.logging import get_logger
+from app.knowledge.service import KnowledgeSkillService
 from app.models.hierarchy import Agent, AgentOS, Team
 from app.repositories.hierarchy_repository import AgentOSRepository, AgentRepository, TeamRepository
 from app.services.capability_service import CapabilityService
@@ -141,6 +156,33 @@ _ASSISTANT_CONTENT_TEAM_EVENT_NAMES = frozenset({"TeamRunResponseContent"})
 # content is the same text reassembled by Agno and is deliberately NOT
 # also collected, to avoid doubling the final message.
 _ASSISTANT_CONTENT_EVENT_NAMES = frozenset({"RunResponseContent"})
+
+
+def _dedupe_self_concatenated(text: str) -> str:
+    """Some Agno completion events (observed on TeamRunCompleted in
+    coordinate mode after a leader relays a single delegated member's
+    answer) surface `content` as the exact same final answer
+    concatenated with itself, no separator - e.g.
+    "X sinh ngay 1992-08-11.X sinh ngay 1992-08-11." instead of the
+    string once. This detects that precise self-concatenation pattern
+    (the string is exactly two identical halves) and collapses it to a
+    single copy.
+
+    Deliberately narrow: it only fires when the two halves are
+    byte-for-byte identical, so it can never truncate a legitimately
+    repetitive answer that merely happens to repeat a word or phrase -
+    only an answer that is the *entire* text duplicated verbatim.
+    """
+    if not text:
+        return text
+    length = len(text)
+    if length % 2 != 0:
+        return text
+    half = length // 2
+    first_half, second_half = text[:half], text[half:]
+    if first_half and first_half == second_half:
+        return first_half
+    return text
 
 
 def _build_stream_payload(event_name: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -244,6 +286,7 @@ class AgnoRuntimeEngine:
         self.prompt_service = PromptCompositionService(session)
         self.model_service = ModelResolutionService(session)
         self.tool_builder = ToolCatalogBuilder()
+        self.knowledge_service = KnowledgeSkillService(session)
 
     async def resolve_context(
         self,
@@ -415,8 +458,23 @@ class AgnoRuntimeEngine:
             return await self.resolve_team_context_by_code(agent_os_code, team_code)
         return await self.resolve_root_context(agent_os_code)
 
+    async def _resolve_instructions(self, ctx: ResolvedRuntimeContext, message: str) -> str:
+        """Folds any Knowledge Skill(s) assigned to this Agent into its
+        final prompt, per docs/Knowledge.md: Knowledge is executed as
+        just another Skill, not embedded into Agent. The Agent never
+        sees how retrieval happened - only the resulting "Knowledge
+        Context" section prepended to its instructions. A Knowledge
+        Skill failure never aborts the run (see
+        KnowledgeSkillService.execute_for_agent) - it degrades to simply
+        contributing no context.
+        """
+        knowledge_context = await self.knowledge_service.execute_for_agent(ctx.agent.id, message)
+        if not knowledge_context:
+            return ctx.final_prompt
+        return f"{knowledge_context}\n\n{ctx.final_prompt}"
+
     async def _build_agno_agent(
-        self, ctx: ResolvedRuntimeContext, mcp_tools, *, user_id: str | None = None
+        self, ctx: ResolvedRuntimeContext, mcp_tools, *, message: str, user_id: str | None = None
     ) -> AgnoAgent:
         model_entry = await self.model_service.resolve_registry_entry(
             agent_model_id=ctx.agent.model_id,
@@ -425,6 +483,15 @@ class AgnoRuntimeEngine:
         agno_model = self.model_service.build_agno_model(
             model_entry, temperature_override=ctx.agent.temperature
         )
+
+        instructions = await self._resolve_instructions(ctx, message)
+        source_tool = await self.knowledge_service.build_source_lookup_tool(ctx.agent.id)
+
+        tools: list[Any] = []
+        if mcp_tools is not None:
+            tools.append(mcp_tools)
+        if source_tool is not None:
+            tools.append(source_tool)
 
         # Agentic memory (LLM self-extracts facts/preferences after each
         # run, ChatGPT-memory style) is only meaningful when we know
@@ -439,8 +506,8 @@ class AgnoRuntimeEngine:
             model=agno_model,
             name=ctx.agent.name,
             agent_id=str(ctx.agent.id),
-            instructions=ctx.final_prompt,
-            tools=[mcp_tools] if mcp_tools is not None else [],
+            instructions=instructions,
+            tools=tools,
             memory=memory,
             enable_user_memories=enable_user_memories,
             storage=build_agent_storage(),
@@ -464,12 +531,14 @@ class AgnoRuntimeEngine:
         Opens an MCP session scoped to ctx.effective_capabilities for the
         duration of this single run, then closes it - the tool catalog is
         always rebuilt fresh from current metadata + the Gateway's live
-        tools/list, never cached across runs.
+        tools/list, never cached across runs. Any Knowledge Skills
+        assigned to this Agent are executed once, eagerly, before the
+        Agno Agent is even constructed (see _resolve_instructions).
         """
         mcp_session = self.tool_builder.build(ctx.effective_capabilities)
         try:
             async with mcp_session as session:
-                agno_agent = await self._build_agno_agent(ctx, session.tools, user_id=user_id)
+                agno_agent = await self._build_agno_agent(ctx, session.tools, message=message, user_id=user_id)
                 response = await agno_agent.arun(
                     message,
                     session_id=session_id,
@@ -483,7 +552,7 @@ class AgnoRuntimeEngine:
         content = getattr(response, "content", None)
         if content is None:
             content = str(response)
-        return content
+        return _dedupe_self_concatenated(content)
 
     async def run_stream(
         self,
@@ -500,7 +569,7 @@ class AgnoRuntimeEngine:
         mcp_session = self.tool_builder.build(ctx.effective_capabilities)
         try:
             async with mcp_session as session:
-                agno_agent = await self._build_agno_agent(ctx, session.tools, user_id=user_id)
+                agno_agent = await self._build_agno_agent(ctx, session.tools, message=message, user_id=user_id)
                 stream = await agno_agent.arun(
                     message,
                     session_id=session_id,
@@ -515,7 +584,7 @@ class AgnoRuntimeEngine:
 
                     content = getattr(event, "content", None)
                     if content:
-                        payload["content"] = content
+                        payload["content"] = _dedupe_self_concatenated(content)
                     payload.update(_build_stream_payload(event_name, payload))
                     tool_calls = getattr(event, "tools", None)
                     if tool_calls:
@@ -532,25 +601,26 @@ class AgnoRuntimeEngine:
         ctx: ResolvedTeamContext,
         exit_stack: AsyncExitStack,
         *,
+        message: str,
         user_id: str | None = None,
     ) -> AgnoTeam:
         """Builds a live agno.team.Team with every enabled member fully
-        constructed (model, prompt, tools, memory) - reusing
-        _build_agno_agent for each member, so a Team run resolves
-        prompts/capabilities/memory identically to how each member would
-        resolve them in a standalone chat turn. Each member's MCP
-        session is opened via `exit_stack`, which the caller (run_team /
-        run_team_stream) closes once the whole Team run completes - all
-        member sessions stay open for the team run's full duration, since
-        agno.team.Team may delegate to any member at any point during
-        its own reasoning loop.
+        constructed (model, prompt, tools, memory, Knowledge context) -
+        reusing _build_agno_agent for each member, so a Team run resolves
+        prompts/capabilities/memory/knowledge identically to how each
+        member would resolve them in a standalone chat turn. Each
+        member's MCP session is opened via `exit_stack`, which the
+        caller (run_team / run_team_stream) closes once the whole Team
+        run completes - all member sessions stay open for the team run's
+        full duration, since agno.team.Team may delegate to any member
+        at any point during its own reasoning loop.
         """
         member_agents: list[AgnoAgent] = []
         for member_ctx in ctx.member_contexts:
             mcp_session = self.tool_builder.build(member_ctx.effective_capabilities)
             session = await exit_stack.enter_async_context(mcp_session)
             member_agents.append(
-                await self._build_agno_agent(member_ctx, session.tools, user_id=user_id)
+                await self._build_agno_agent(member_ctx, session.tools, message=message, user_id=user_id)
             )
 
         # The Team coordinator's own model: Teams have no model_id of
@@ -571,6 +641,9 @@ class AgnoRuntimeEngine:
             name=ctx.team.name,
             team_id=str(ctx.team.id),
             instructions=ctx.team_prompt,
+            storage=build_team_storage(),
+            add_history_to_messages=True,
+            num_history_runs=10,
             show_tool_calls=True,
             markdown=True,
             add_datetime_to_instructions=True,
@@ -593,7 +666,7 @@ class AgnoRuntimeEngine:
         """
         async with AsyncExitStack() as exit_stack:
             try:
-                agno_team = await self._build_agno_team(ctx, exit_stack, user_id=user_id)
+                agno_team = await self._build_agno_team(ctx, exit_stack, message=message, user_id=user_id)
                 response = await agno_team.arun(
                     message,
                     session_id=session_id,
@@ -607,7 +680,7 @@ class AgnoRuntimeEngine:
         content = getattr(response, "content", None)
         if content is None:
             content = str(response)
-        return content
+        return _dedupe_self_concatenated(content)
 
     async def run_team_stream(
         self,
@@ -636,7 +709,7 @@ class AgnoRuntimeEngine:
         own_team_id = str(ctx.team.id)
         async with AsyncExitStack() as exit_stack:
             try:
-                agno_team = await self._build_agno_team(ctx, exit_stack, user_id=user_id)
+                agno_team = await self._build_agno_team(ctx, exit_stack, message=message, user_id=user_id)
                 stream = await agno_team.arun(
                     message,
                     session_id=session_id,
@@ -651,7 +724,7 @@ class AgnoRuntimeEngine:
 
                     content = getattr(event, "content", None)
                     if content:
-                        payload["content"] = content
+                        payload["content"] = _dedupe_self_concatenated(content)
                         payload["is_assistant_content"] = (
                             event_name in _ASSISTANT_CONTENT_TEAM_EVENT_NAMES
                             and getattr(event, "team_id", None) == own_team_id
@@ -671,6 +744,7 @@ class AgnoRuntimeEngine:
         ctx: ResolvedRootContext,
         exit_stack: AsyncExitStack,
         *,
+        message: str,
         mode: Literal["route", "coordinate", "collaborate"] = "route",
         user_id: str | None = None,
     ) -> AgnoTeam:
@@ -680,11 +754,12 @@ class AgnoRuntimeEngine:
         code - decides which child Team handles a given request.
 
         Every child Team is built eagerly via _build_agno_team (reusing
-        the exact same per-member MCP session / model / memory wiring as
-        an explicit team_code call would use), so behavior is identical
-        whether a Team is reached through auto-routing or by name. This
-        means every enabled Agent's MCP session under this AgentOS gets
-        opened for the run - no LLM calls happen for child Teams the
+        the exact same per-member MCP session / model / memory / Knowledge
+        wiring as an explicit team_code call would use), so behavior is
+        identical whether a Team is reached through auto-routing or by
+        name. This means every enabled Agent's MCP session (and any
+        Knowledge Skill it has assigned) under this AgentOS gets
+        exercised for the run - no LLM calls happen for child Teams the
         Root Team's leader doesn't end up delegating to, but the session
         setup cost is paid regardless. If that becomes a bottleneck for
         AgentOS instances with many Teams, the fix is lazy per-member
@@ -697,7 +772,7 @@ class AgnoRuntimeEngine:
         AgentOS's Teams are meant to be combinable within one answer.
         """
         member_teams: list[AgnoTeam] = [
-            await self._build_agno_team(team_ctx, exit_stack, user_id=user_id)
+            await self._build_agno_team(team_ctx, exit_stack, message=message, user_id=user_id)
             for team_ctx in ctx.team_contexts
         ]
 
@@ -714,6 +789,9 @@ class AgnoRuntimeEngine:
             name=f"{ctx.agent_os.name} Router",
             team_id=f"root-{ctx.agent_os.id}",
             instructions=ctx.root_prompt,
+            storage=build_team_storage(),
+            add_history_to_messages=True,
+            num_history_runs=10,
             show_tool_calls=True,
             markdown=True,
             add_datetime_to_instructions=True,
@@ -735,7 +813,7 @@ class AgnoRuntimeEngine:
         async with AsyncExitStack() as exit_stack:
             try:
                 agno_root_team = await self._build_agno_root_team(
-                    ctx, exit_stack, mode=mode, user_id=user_id
+                    ctx, exit_stack, message=message, mode=mode, user_id=user_id
                 )
                 response = await agno_root_team.arun(
                     message,
@@ -750,7 +828,7 @@ class AgnoRuntimeEngine:
         content = getattr(response, "content", None)
         if content is None:
             content = str(response)
-        return content
+        return _dedupe_self_concatenated(content)
 
     async def run_root_stream(
         self,
@@ -792,7 +870,7 @@ class AgnoRuntimeEngine:
         async with AsyncExitStack() as exit_stack:
             try:
                 agno_root_team = await self._build_agno_root_team(
-                    ctx, exit_stack, mode=mode, user_id=user_id
+                    ctx, exit_stack, message=message, mode=mode, user_id=user_id
                 )
                 stream = await agno_root_team.arun(
                     message,
@@ -808,7 +886,7 @@ class AgnoRuntimeEngine:
 
                     content = getattr(event, "content", None)
                     if content:
-                        payload["content"] = content
+                        payload["content"] = _dedupe_self_concatenated(content)
                         payload["is_assistant_content"] = (
                             event_name in _ASSISTANT_CONTENT_TEAM_EVENT_NAMES
                             and getattr(event, "team_id", None) == own_team_id

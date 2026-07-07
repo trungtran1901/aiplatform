@@ -4,17 +4,21 @@ import asyncio
 import json
 from uuid import UUID
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, status
 from sse_starlette.sse import EventSourceResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import PaginationParams, get_db
 from app.core.config import get_settings
+from app.core.run_control import request_cancel
+from app.models.run import RunStatus
 from app.repositories.run_repository import AgentEventRepository, AgentRunRepository
 from app.schemas.common import PaginatedResponse
 from app.schemas.run import AgentEventRead, AgentRunRead
 
 router = APIRouter(prefix="/runs", tags=["Runs"])
+
+_TERMINAL_STATUSES = (RunStatus.completed, RunStatus.failed, RunStatus.cancelled)
 
 
 @router.get("", response_model=PaginatedResponse[AgentRunRead])
@@ -46,6 +50,37 @@ async def list_run_events(run_id: UUID, db: AsyncSession = Depends(get_db)):
     repo = AgentEventRepository(db)
     events = await repo.list_by_run(run_id)
     return [AgentEventRead.model_validate(e) for e in events]
+
+
+@router.post("/{run_id}/cancel", status_code=status.HTTP_202_ACCEPTED)
+async def cancel_run(run_id: UUID, db: AsyncSession = Depends(get_db)):
+    """
+    Requests that an in-flight run stop as soon as possible - the same
+    role a "Stop generating" button plays in a chat UI. This returns
+    immediately (202 Accepted): it only signals intent, it does not
+    itself stop anything. Whichever runtime instance is actually
+    streaming this run's events (app/services/chat_service.py::
+    handle_chat_stream) checks for this signal once per streamed event
+    and, on the next check, closes the underlying Agno stream and marks
+    the run `cancelled` - typically within one model/tool-call chunk's
+    worth of latency. Poll `GET /runs/{id}` or watch
+    `GET /runs/{id}/stream` for status to become `cancelled`.
+
+    No-ops harmlessly (no signal sent) if the run has already reached a
+    terminal status. If the run isn't actually executing on any
+    instance right now (e.g. the request that started it already
+    disconnected), the signal is simply never read and expires unused -
+    this endpoint performs no authorization of its own, same as every
+    other endpoint in this runtime.
+    """
+    repo = AgentRunRepository(db)
+    run = await repo.get_or_404(run_id)
+
+    if run.status in _TERMINAL_STATUSES:
+        return {"run_id": str(run_id), "status": run.status.value, "cancel_requested": False}
+
+    await request_cancel(str(run_id))
+    return {"run_id": str(run_id), "status": run.status.value, "cancel_requested": True}
 
 
 @router.get("/{run_id}/stream")
@@ -89,7 +124,7 @@ async def stream_run_events(run_id: UUID, db: AsyncSession = Depends(get_db)):
                     ),
                 }
 
-            if run.status.value in ("completed", "failed"):
+            if run.status.value in ("completed", "failed", "cancelled"):
                 yield {"event": "stream_closed", "data": json.dumps({"status": run.status.value})}
                 return
 
