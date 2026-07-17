@@ -89,6 +89,21 @@ class Settings(BaseSettings):
     # --- SSE / Streaming ---
     SSE_KEEPALIVE_SECONDS: int = 15
 
+    # --- AgentX Runtime v2 feature flags ---
+    # All default OFF. Existing .env files require zero changes; runtime
+    # behavior is byte-for-byte identical to pre-v2 until a flag is
+    # explicitly turned on. Each subsystem is independently toggleable
+    # per the spec's "Feature Flags" / "Dynamic Configuration" sections.
+    FEATURE_UI_METADATA_REGISTRY: bool = False
+    FEATURE_BUSINESS_OBJECT_REGISTRY: bool = False
+    FEATURE_CONTEXT_ENGINE: bool = False
+    FEATURE_PLANNING_ENGINE: bool = False
+    FEATURE_EXECUTION_ENGINE: bool = False
+    FEATURE_OBSERVATION_ENGINE: bool = False
+    FEATURE_EVENT_ENGINE: bool = False
+    FEATURE_UI_SKILLS: bool = False
+    FEATURE_UI_ACTIONS: bool = False
+
     @property
     def is_production(self) -> bool:
         return self.APP_ENV == "production"
