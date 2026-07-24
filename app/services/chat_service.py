@@ -138,6 +138,7 @@ class ChatService:
                     request.message,
                     session_id=str(chat_session.id),
                     user_id=request.user_id,
+                    ui_context=request.uiContext,
                 ):
                     await self.run_service.emit_event(run.id, _safe_event_type(event["event_type"]), event["payload"])
 
@@ -189,7 +190,7 @@ class ChatService:
 
             # Call the non-streaming route to get final output
             output = await self.engine.run_team(
-                ctx, request.message, session_id=str(chat_session.id), user_id=request.user_id
+                ctx, request.message, session_id=str(chat_session.id), user_id=request.user_id, ui_context=request.uiContext,
             )
 
             await self.message_repo.create(
@@ -345,6 +346,7 @@ class ChatService:
                 request.message,
                 session_id=str(chat_session.id),
                 user_id=request.user_id,
+                ui_context=request.uiContext,
             )
             try:
                 async for event in stream:
@@ -435,6 +437,7 @@ class ChatService:
                 request.message,
                 session_id=str(chat_session.id),
                 user_id=request.user_id,
+                ui_context=request.uiContext,
             )
             try:
                 async for event in stream:
@@ -526,6 +529,7 @@ class ChatService:
                 request.message,
                 session_id=str(chat_session.id),
                 user_id=request.user_id,
+                ui_context=request.uiContext,
             )
             try:
                 async for event in stream:

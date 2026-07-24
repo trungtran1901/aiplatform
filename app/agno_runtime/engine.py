@@ -503,20 +503,36 @@ class AgnoRuntimeEngine:
             return await self.resolve_team_context_by_code(agent_os_code, team_code)
         return await self.resolve_root_context(agent_os_code)
 
-    async def _resolve_instructions(self, ctx: ResolvedRuntimeContext, message: str) -> str:
-        """Folds any Knowledge Skill(s) assigned to this Agent into its
-        final prompt, per docs/Knowledge.md: Knowledge is executed as
-        just another Skill, not embedded into Agent. The Agent never
-        sees how retrieval happened - only the resulting "Knowledge
-        Context" section prepended to its instructions. A Knowledge
-        Skill failure never aborts the run (see
-        KnowledgeSkillService.execute_for_agent) - it degrades to simply
-        contributing no context.
-        """
+    async def _resolve_instructions(self, ctx, message, ui_context=None):
         knowledge_context = await self.knowledge_service.execute_for_agent(ctx.agent.id, message)
-        if not knowledge_context:
-            return ctx.final_prompt
-        return f"{knowledge_context}\n\n{ctx.final_prompt}"
+
+        attachment_context = ""
+        has_valid_attachment = False
+        attachment_ids_raw = getattr(ui_context, "attachments", None) if ui_context else None
+        if attachment_ids_raw:
+            import uuid as uuid_module
+            from app.attachments.service import AttachmentService
+            attachment_service = AttachmentService(self.session)
+            try:
+                attachment_ids = [uuid_module.UUID(a) for a in attachment_ids_raw]
+            except (ValueError, TypeError):
+                attachment_ids = []
+            if attachment_ids:
+                attachment_context = await attachment_service.render_for_prompt(attachment_ids)
+                has_valid_attachment = "KHÔNG đọc được" not in attachment_context and bool(attachment_context)
+
+        priority_note = ""
+        if has_valid_attachment:
+            priority_note = (
+                "\n\nLƯU Ý QUAN TRỌNG: Người dùng vừa đính kèm file trong tin nhắn này. "
+                "Hãy ưu tiên trả lời dựa trên nội dung file đính kèm ở trên, KHÔNG tự động "
+                "tìm kiếm hay trộn lẫn với tài liệu khác trong Knowledge Base trừ khi người "
+                "dùng yêu cầu rõ ràng."
+            )
+
+        parts = [p for p in (attachment_context, knowledge_context, ctx.final_prompt) if p]
+        result = "\n\n".join(parts) if parts else ctx.final_prompt
+        return result + priority_note
 
     async def _build_agno_agent(
         self,
@@ -526,6 +542,7 @@ class AgnoRuntimeEngine:
         message: str,
         session_id: str,
         user_id: str | None = None,
+        ui_context: Any = None,          # <-- THÊM
     ) -> AgnoAgent:
         model_entry = await self.model_service.resolve_registry_entry(
             agent_model_id=ctx.agent.model_id,
@@ -535,7 +552,7 @@ class AgnoRuntimeEngine:
             model_entry, temperature_override=ctx.agent.temperature
         )
 
-        instructions = await self._resolve_instructions(ctx, message)
+        instructions = await self._resolve_instructions(ctx, message, ui_context)   # <-- SỬA dòng này
         source_tool = await self.knowledge_service.build_source_lookup_tool(ctx.agent.id)
 
         # --- AgentX v2: Business Object tools (lazy, selective per-Agent
@@ -622,40 +639,22 @@ class AgnoRuntimeEngine:
         *,
         session_id: str,
         user_id: str | None = None,
+        ui_context: Any = None,          # <-- THÊM
     ) -> str:
-        """Non-streaming execution. Returns the final text response.
-
-        Opens an MCP session scoped to ctx.effective_capabilities for the
-        duration of this single run, then closes it - the tool catalog is
-        always rebuilt fresh from current metadata + the Gateway's live
-        tools/list, never cached across runs. Any Knowledge Skills
-        assigned to this Agent are executed once, eagerly, before the
-        Agno Agent is even constructed (see _resolve_instructions).
-
-        AgentX v2: after this call, `self.last_ui_action_plan` holds the
-        UIActionPlan aggregated from any propose_ui_action tool calls
-        made during this run (empty plan if none) - callers that want to
-        forward it to the frontend can read it right after awaiting run().
-        """
         self._reset_ui_action_collectors()
         mcp_session = self.tool_builder.build(ctx.effective_capabilities)
         try:
             async with mcp_session as session:
                 agno_agent = await self._build_agno_agent(
-                    ctx, session.tools, message=message, session_id=session_id, user_id=user_id
+                    ctx, session.tools, message=message, session_id=session_id,
+                    user_id=user_id, ui_context=ui_context,   # <-- THÊM
                 )
-                response = await agno_agent.arun(
-                    message,
-                    session_id=session_id,
-                    user_id=user_id,
-                    stream=False,
-                )
+                response = await agno_agent.arun(message, session_id=session_id, user_id=user_id, stream=False)
         except Exception as exc:  # noqa: BLE001
             logger.error("agno_run_failed", error=str(exc), agent_code=ctx.agent.code)
             raise RuntimeExecutionError(f"Agno agent execution failed: {exc}") from exc
 
         self.last_ui_action_plan = self._aggregate_ui_action_plan(run_id=session_id)
-
         content = getattr(response, "content", None)
         if content is None:
             content = str(response)
@@ -668,32 +667,19 @@ class AgnoRuntimeEngine:
         *,
         session_id: str,
         user_id: str | None = None,
+        ui_context: Any = None,          # <-- THÊM
     ) -> AsyncIterator[dict[str, Any]]:
-        """Streaming execution. Yields normalized event dicts as Agno
-        surfaces RunResponseEvents, mapped onto the platform's EventType
-        vocabulary. Same MCP session lifecycle as run() above, held open
-        for the duration of the streamed run.
-
-        AgentX v2: if any propose_ui_action tool calls were made during
-        this run, one additional event is yielded after the stream
-        completes: {"event_type": "ui_action_plan", "payload": {
-        "is_assistant_content": False, "ui_action_plan": <UIActionPlan
-        dict>}} - existing consumers that don't recognize this event_type
-        can safely ignore it (is_assistant_content=False means it's never
-        folded into assistant text)."""
         self._reset_ui_action_collectors()
         mcp_session = self.tool_builder.build(ctx.effective_capabilities)
         try:
             async with mcp_session as session:
                 agno_agent = await self._build_agno_agent(
-                    ctx, session.tools, message=message, session_id=session_id, user_id=user_id
+                    ctx, session.tools, message=message, session_id=session_id,
+                    user_id=user_id, ui_context=ui_context,   # <-- THÊM
                 )
                 stream = await agno_agent.arun(
-                    message,
-                    session_id=session_id,
-                    user_id=user_id,
-                    stream=True,
-                    stream_intermediate_steps=True,
+                    message, session_id=session_id, user_id=user_id,
+                    stream=True, stream_intermediate_steps=True,
                 )
                 async for event in stream:
                     event_name = getattr(event, "event", None) or type(event).__name__
@@ -732,39 +718,18 @@ class AgnoRuntimeEngine:
         message: str,
         session_id: str,
         user_id: str | None = None,
+        ui_context: Any = None,          # <-- THÊM
     ) -> AgnoTeam:
-        """Builds a live agno.team.Team with every enabled member fully
-        constructed (model, prompt, tools, memory, Knowledge context) -
-        reusing _build_agno_agent for each member, so a Team run resolves
-        prompts/capabilities/memory/knowledge identically to how each
-        member would resolve them in a standalone chat turn. Each
-        member's MCP session is opened via `exit_stack`, which the
-        caller (run_team / run_team_stream) closes once the whole Team
-        run completes - all member sessions stay open for the team run's
-        full duration, since agno.team.Team may delegate to any member
-        at any point during its own reasoning loop.
-
-        AgentX v2: each member's Business Object / UI Action tools are
-        wired in transparently via _build_agno_agent - no team-specific
-        code needed here, since _ui_action_collectors is tracked on this
-        engine instance and accumulates across every member built during
-        this call.
-        """
         member_agents: list[AgnoAgent] = []
         for member_ctx in ctx.member_contexts:
             mcp_session = self.tool_builder.build(member_ctx.effective_capabilities)
             session = await exit_stack.enter_async_context(mcp_session)
             member_agents.append(
                 await self._build_agno_agent(
-                    member_ctx, session.tools, message=message, session_id=session_id, user_id=user_id
+                    member_ctx, session.tools, message=message, session_id=session_id,
+                    user_id=user_id, ui_context=ui_context,   # <-- THÊM
                 )
             )
-
-        # The Team coordinator's own model: Teams have no model_id of
-        # their own in the existing schema (intentionally not modified
-        # per "DO NOT rewrite existing AgentOS architecture") - falls
-        # back to the AgentOS default model, same as any Agent that
-        # doesn't set its own model_id.
         model_entry = await self.model_service.resolve_registry_entry(
             agent_model_id=None,
             agent_os_default_model_id=ctx.agent_os.default_model_id,
@@ -793,29 +758,16 @@ class AgnoRuntimeEngine:
         *,
         session_id: str,
         user_id: str | None = None,
+        ui_context: Any = None,          # <-- THÊM
     ) -> str:
-        """Non-streaming Team execution. Returns the final text response.
-
-        Opens one MCP session per enabled member agent (all held open
-        for the duration of this single run via an AsyncExitStack, since
-        agno.team.Team's coordinator may delegate to any member at any
-        point), then closes all of them together.
-
-        AgentX v2: `self.last_ui_action_plan` is populated exactly like
-        in run(), aggregated across every member that proposed actions.
-        """
         self._reset_ui_action_collectors()
         async with AsyncExitStack() as exit_stack:
             try:
                 agno_team = await self._build_agno_team(
-                    ctx, exit_stack, message=message, session_id=session_id, user_id=user_id
+                    ctx, exit_stack, message=message, session_id=session_id,
+                    user_id=user_id, ui_context=ui_context,   # <-- THÊM
                 )
-                response = await agno_team.arun(
-                    message,
-                    session_id=session_id,
-                    user_id=user_id,
-                    stream=False,
-                )
+                response = await agno_team.arun(message, session_id=session_id, user_id=user_id, stream=False)
             except Exception as exc:  # noqa: BLE001
                 logger.error("agno_team_run_failed", error=str(exc), team_code=ctx.team.code)
                 raise RuntimeExecutionError(f"Agno team execution failed: {exc}") from exc
@@ -834,32 +786,15 @@ class AgnoRuntimeEngine:
         *,
         session_id: str,
         user_id: str | None = None,
+        ui_context: Any = None,          # <-- THÊM
     ) -> AsyncIterator[dict[str, Any]]:
-        """Streaming Team execution. Yields normalized event dicts as
-        Agno surfaces TeamRunResponseEvents, mapped onto the platform's
-        EventType vocabulary via _AGNO_TEAM_EVENT_MAP. Same multi-session
-        MCP lifecycle as run_team()  above.
-
-        AgentX v2: same trailing `ui_action_plan` event as run_stream(),
-        aggregated across every member."""
-        # Agno's `atransfer_task_to_member` tool (used internally for
-        # delegation) forwards a member's own stream events verbatim
-        # instead of wrapping them as intermediate events. When a member
-        # is itself an agno.team.Team (team-of-teams, see
-        # _build_agno_root_team), that leaked event carries the exact
-        # same event name ("TeamRunResponseContent") as this team's own
-        # final content event - the only thing that tells them apart is
-        # `team_id`, which on a leaked event is the *member* team's id,
-        # not this team's. Without this check, both the member's own
-        # answer and this team's relayed/synthesized answer get
-        # collected as assistant content and concatenated, producing a
-        # duplicated final message.
         own_team_id = str(ctx.team.id)
         self._reset_ui_action_collectors()
         async with AsyncExitStack() as exit_stack:
             try:
                 agno_team = await self._build_agno_team(
-                    ctx, exit_stack, message=message, session_id=session_id, user_id=user_id
+                    ctx, exit_stack, message=message, session_id=session_id,
+                    user_id=user_id, ui_context=ui_context,   # <-- THÊM
                 )
                 stream = await agno_team.arun(
                     message,
@@ -909,32 +844,13 @@ class AgnoRuntimeEngine:
         session_id: str,
         mode: Literal["route", "coordinate", "collaborate"] = "route",
         user_id: str | None = None,
+        ui_context: Any = None,          # <-- THÊM
     ) -> AgnoTeam:
-        """Builds the "Root Team" for an AgentOS: a Team whose members
-        are other, fully-constructed Teams (Agno's team-of-teams
-        pattern), so the Root Team's own leader model - not platform
-        code - decides which child Team handles a given request.
-
-        Every child Team is built eagerly via _build_agno_team (reusing
-        the exact same per-member MCP session / model / memory / Knowledge
-        wiring as an explicit team_code call would use), so behavior is
-        identical whether a Team is reached through auto-routing or by
-        name. This means every enabled Agent's MCP session (and any
-        Knowledge Skill it has assigned) under this AgentOS gets
-        exercised for the run - no LLM calls happen for child Teams the
-        Root Team's leader doesn't end up delegating to, but the session
-        setup cost is paid regardless. If that becomes a bottleneck for
-        AgentOS instances with many Teams, the fix is lazy per-member
-        construction (Agno supports passing a callable for `members`,
-        evaluated at run start) rather than restructuring this method.
-
-        mode defaults to TeamMode.route (pick exactly one child Team and
-        hand off fully) since that matches "os quyết định team nào" as a
-        single dispatch decision; pass TeamMode.coordinate instead if an
-        AgentOS's Teams are meant to be combinable within one answer.
-        """
         member_teams: list[AgnoTeam] = [
-            await self._build_agno_team(team_ctx, exit_stack, message=message, session_id=session_id, user_id=user_id)
+            await self._build_agno_team(
+                team_ctx, exit_stack, message=message, session_id=session_id,
+                user_id=user_id, ui_context=ui_context,   # <-- THÊM
+            )
             for team_ctx in ctx.team_contexts
         ]
 
@@ -967,26 +883,16 @@ class AgnoRuntimeEngine:
         session_id: str,
         mode: Literal["route", "coordinate", "collaborate"] = "route",
         user_id: str | None = None,
+        ui_context: Any = None,          # <-- THÊM
     ) -> str:
-        """Non-streaming execution for the "only agent_os_code given"
-        case: builds the Root Team (all child Teams, all their member
-        Agents, all MCP sessions) and lets Agno's own leader model decide
-        routing. Same single-AsyncExitStack lifecycle as run_team().
-
-        AgentX v2: `self.last_ui_action_plan` aggregated across every
-        member of every child Team, same as run_team()."""
         self._reset_ui_action_collectors()
         async with AsyncExitStack() as exit_stack:
             try:
                 agno_root_team = await self._build_agno_root_team(
-                    ctx, exit_stack, message=message, session_id=session_id, mode=mode, user_id=user_id
+                    ctx, exit_stack, message=message, session_id=session_id,
+                    mode=mode, user_id=user_id, ui_context=ui_context,   # <-- THÊM
                 )
-                response = await agno_root_team.arun(
-                    message,
-                    session_id=session_id,
-                    user_id=user_id,
-                    stream=False,
-                )
+                response = await agno_root_team.arun(message, session_id=session_id, user_id=user_id, stream=False)
             except Exception as exc:  # noqa: BLE001
                 logger.error("agno_root_run_failed", error=str(exc), agent_os_code=ctx.agent_os.code)
                 raise RuntimeExecutionError(f"Agno root team execution failed: {exc}") from exc
@@ -1006,43 +912,15 @@ class AgnoRuntimeEngine:
         session_id: str,
         mode: Literal["route", "coordinate", "collaborate"] = "route",
         user_id: str | None = None,
+        ui_context: Any = None,          # <-- THÊM
     ) -> AsyncIterator[dict[str, Any]]:
-        """Streaming counterpart of run_root(). Reuses
-        _AGNO_TEAM_EVENT_MAP since the Root Team is still an
-        agno.team.Team under the hood (its members merely happen to be
-        Teams rather than Agents) - observability consumers see the same
-        EventType vocabulary regardless of how many routing layers were
-        involved.
-
-        IMPORTANT: the Root Team's members are themselves full
-        agno.team.Team objects (team-of-teams). Agno's delegation tool
-        (`atransfer_task_to_member`) forwards a delegated-to member's own
-        stream events verbatim rather than wrapping them as intermediate
-        events - so when that member is a Team, its own final content
-        event is emitted with the *same* event name
-        ("TeamRunResponseContent") as this Root Team's own final/relayed
-        content event (mode="route" -> respond_directly=True ->
-        show_result relays the child Team's answer as this team's own
-        content). The only field that distinguishes "the child team's
-        own answer, leaked through the tool call" from "this Root Team's
-        own final answer" is `team_id`. Without filtering on it, both
-        get collected as assistant content and concatenated in
-        ChatService, producing a duplicated final message - this is
-        exactly the bug where selecting only agent_os (no team) yields a
-        doubled-up answer while selecting a team explicitly does not
-        (there, the member is a plain Agent, whose native event name
-        "RunResponseContent" doesn't collide with "TeamRunResponseContent"
-        in the first place).
-
-        AgentX v2: same trailing `ui_action_plan` event as
-        run_team_stream(), aggregated across every member of every child
-        Team."""
         own_team_id = f"root-{ctx.agent_os.id}"
         self._reset_ui_action_collectors()
         async with AsyncExitStack() as exit_stack:
             try:
                 agno_root_team = await self._build_agno_root_team(
-                    ctx, exit_stack, message=message, session_id=session_id, mode=mode, user_id=user_id
+                    ctx, exit_stack, message=message, session_id=session_id,
+                    mode=mode, user_id=user_id, ui_context=ui_context,   # <-- THÊM
                 )
                 stream = await agno_root_team.arun(
                     message,

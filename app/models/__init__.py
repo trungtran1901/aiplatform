@@ -28,7 +28,8 @@ from app.models.workflow_run import (  # noqa: F401
     WorkflowRunStep,
     WorkflowStepStatus,
 )
-
+from app.models.workflow_schedule import ScheduleType, WorkflowSchedule  # noqa: F401
+from app.models.workflow_webhook import WorkflowWebhook  # noqa: F401
 __all__ = [
     "Base",
     "AgentOS",
@@ -71,4 +72,5 @@ __all__ = [
     "ExecutionPlanRunStatus",
     "ExecutionPlanStepRun",
     "ExecutionStepStatus",
+    "WorkflowSchedule", "ScheduleType", "WorkflowWebhook"
 ]

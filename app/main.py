@@ -25,7 +25,7 @@ from app.core.exceptions import AgnoRuntimeError
 from app.core.logging import configure_logging, correlation_id_var, get_logger
 from app.core.middleware import RequestContextMiddleware
 from app.observability.health import router as health_router
-
+import asyncio
 settings = get_settings()
 configure_logging()
 logger = get_logger(__name__)
@@ -37,10 +37,23 @@ async def lifespan(app: FastAPI):
 
     if settings.OTEL_ENABLED:
         from app.observability.tracing import configure_tracing
-
         configure_tracing(app)
 
+    ticker_task = None
+    if settings.FEATURE_WORKFLOW_SCHEDULING:
+        from app.schedule.ticker import run_ticker_loop, stop_ticker
+        ticker_task = asyncio.create_task(run_ticker_loop())
+
     yield
+
+    if ticker_task is not None:
+        stop_ticker()
+        ticker_task.cancel()
+        try:
+            await ticker_task
+        except asyncio.CancelledError:
+            pass
+
     logger.info("agno_runtime_shutting_down")
 
 

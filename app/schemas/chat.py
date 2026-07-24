@@ -26,7 +26,10 @@ class UIContextFields(BaseModel):
     currentRecord: dict | None = Field(default=None, description="The business record currently open, if any")
     route: str | None = Field(default=None, description="Current frontend route/path")
     variables: dict | None = Field(default=None, description="Free-form session/runtime variables")
-    attachments: list[dict] | None = Field(default=None, description="File/attachment references for this turn")
+    attachments: list[str] | None = Field(
+        default=None,
+        description="List of attachment_id (UUID string) previously uploaded via POST /attachments/upload",
+    )   
     locale: str | None = Field(default=None, description="e.g. 'en-US', 'vi-VN'")
     device: str | None = Field(default=None, description="e.g. 'desktop', 'mobile', 'tablet'")
 

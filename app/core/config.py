@@ -51,7 +51,20 @@ class Settings(BaseSettings):
     # --- Redis ---
     REDIS_URL: str = "redis://localhost:6379/0"
     REDIS_EVENT_STREAM_TTL_SECONDS: int = 3600
-
+    # --- Storage (MinIO) ---
+    STORAGE_PROVIDER: str = "minio"
+    MINIO_ENDPOINT: str = "http://localhost:9000"
+    MINIO_ACCESS_KEY: str = "admin"
+    MINIO_SECRET_KEY: str = ""
+    MINIO_SECURE: bool = False
+    MINIO_BUCKET: str = "knowledge-platform"
+    FEATURE_WORKFLOW_SCHEDULING: bool = False
+    FEATURE_WORKFLOW_WEBHOOKS: bool = False
+    WORKFLOW_SCHEDULER_TICK_SECONDS: int = 30
+    WORKFLOW_SCHEDULER_LOCK_TTL_SECONDS: int = 60
+    # --- OCR Service ---
+    OCR_SERVICE_URL: str = "http://localhost:8003"
+    OCR_TIMEOUT_SECONDS: float = 60.0
     # --- MCP Gateway ---
     # MCP Gateway Core exposes a real MCP server over SSE (its
     # `mcp_server/` package, default port 8100, path /sse). Agno Runtime
