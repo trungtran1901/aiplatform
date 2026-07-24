@@ -29,6 +29,28 @@ hit it closes the underlying stream (releasing its MCP session via the
 same async-generator cleanup path a normal completion takes), marks the
 run CANCELLED with whatever partial content had already been produced,
 and stops - no further events are yielded for that run.
+
+IDENTITY + QUOTA (added):
+Every entrypoint below (`handle_chat`, `handle_chat_stream`) first
+resolves the EFFECTIVE user_id/groups via
+app.core.identity_context.resolve_effective_user_id() - this replaces
+raw trust in `request.user_id` with a Keycloak-verified `sub` whenever
+a verified identity is present on the request (see
+app/core/identity.py, app/core/middleware.py). `request.user_id` is
+overwritten in place so every downstream consumer (session ownership,
+Agno's own agentic memory scoping, quota) uses exactly the same value -
+there is deliberately only one place in this file that decides "who is
+this request for".
+
+Quota is enforced (`QuotaService.assert_within_quota`) once per chat
+turn, right before a run is created - a caller that is already over
+their configured limit never gets an AgentRun row created at all, and
+sees a 429 `quota_exceeded` (mapped automatically by app/main.py's
+existing AgnoRuntimeError handler - QuotaExceededError is a subclass).
+Actual usage is recorded (`QuotaService.record_usage`) once a run
+completes successfully, from whatever token metrics Agno's response
+exposes - this is best-effort by design (see QuotaService) and never
+allowed to fail an otherwise-successful chat turn.
 """
 from __future__ import annotations
 
@@ -38,16 +60,51 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agno_runtime.agui_interface import AgnoAguiInterface, _merge_text_chunks
 from app.agno_runtime.engine import AgnoRuntimeEngine, ResolvedRuntimeContext, ResolvedTeamContext, ResolvedRootContext
+from app.core.config import get_settings
 from app.core.exceptions import NotFoundError, RuntimeExecutionError
+from app.core.identity_context import resolve_effective_user_id
 from app.core.logging import get_logger
 from app.core.run_control import clear_cancel, is_cancelled
 from app.models.run import EventType
 from app.models.session import MessageRole
 from app.repositories.session_repository import ChatMessageRepository, ChatSessionRepository
 from app.schemas.chat import ChatRequest
+from app.services.quota_service import QuotaService
 from app.services.run_service import RunTrackingService
 
 logger = get_logger(__name__)
+
+
+def _extract_token_usage(resp_or_event: Any) -> tuple[int, int]:
+    """Best-effort extraction of (input_tokens, output_tokens) from an
+    Agno RunResponse / stream event's `.metrics`. Agno's `.metrics` can
+    be a plain dict or a small metrics object depending on version/path
+    (single-agent vs Team run), so both shapes are handled. Returns
+    (0, 0) - never raises - when metrics are absent or in an
+    unrecognized shape, since token accounting must never break an
+    otherwise-successful chat turn.
+
+    NOTE: verify the exact field names against the Agno version actually
+    pinned in requirements.txt before relying on this for billing-grade
+    accuracy - field names have moved between Agno releases.
+    """
+    metrics = getattr(resp_or_event, "metrics", None)
+    if metrics is None and isinstance(resp_or_event, dict):
+        metrics = resp_or_event.get("metrics")
+    if metrics is None:
+        return 0, 0
+
+    if isinstance(metrics, dict):
+        input_tokens = metrics.get("input_tokens") or metrics.get("prompt_tokens") or 0
+        output_tokens = metrics.get("output_tokens") or metrics.get("completion_tokens") or 0
+    else:
+        input_tokens = getattr(metrics, "input_tokens", None) or getattr(metrics, "prompt_tokens", 0) or 0
+        output_tokens = getattr(metrics, "output_tokens", None) or getattr(metrics, "completion_tokens", 0) or 0
+
+    try:
+        return int(input_tokens or 0), int(output_tokens or 0)
+    except (TypeError, ValueError):
+        return 0, 0
 
 
 class ChatService:
@@ -58,6 +115,22 @@ class ChatService:
         self.run_service = RunTrackingService(session)
         self.engine = AgnoRuntimeEngine(session)
         self.agui_interface = AgnoAguiInterface()
+        self.quota_service = QuotaService(session)
+
+    def _resolve_identity(self, request: ChatRequest) -> list[str]:
+        """Overwrites request.user_id in place with the effective
+        (Keycloak-verified when available) user id, and returns the
+        caller's verified groups (empty list when no verified identity
+        is present, e.g. AUTH_MODE=trust_client_user_id and no bearer
+        token was sent). Called once at the top of every public
+        entrypoint below, before anything else touches request.user_id.
+        """
+        settings = get_settings()
+        effective_user_id, verified_groups = resolve_effective_user_id(
+            request.user_id, auth_mode=settings.AUTH_MODE
+        )
+        request.user_id = effective_user_id
+        return verified_groups
 
     async def _get_or_create_session(self, request: ChatRequest, agent_os_id, team_id, agent_id):
         if request.session_id:
@@ -109,6 +182,8 @@ class ChatService:
         the streaming endpoint - only the final aggregated text is
         returned to the caller here.
         """
+        verified_groups = self._resolve_identity(request)
+
         ctx = await self.engine.resolve_dispatch_context(request.agentOs, request.team)
 
         # Three dispatch outcomes: single-Agent (ResolvedRuntimeContext),
@@ -116,6 +191,12 @@ class ChatService:
         if isinstance(ctx, ResolvedRuntimeContext):
             selected_team = ctx.team
             selected_agent = ctx.agent
+            model_id_for_quota = selected_agent.model_id or ctx.agent_os.default_model_id
+
+            await self.quota_service.assert_within_quota(
+                user_id=request.user_id, groups=verified_groups, model_id=model_id_for_quota
+            )
+
             chat_session = await self._get_or_create_session(
                 request, ctx.agent_os.id, selected_team.id, selected_agent.id
             )
@@ -132,6 +213,8 @@ class ChatService:
             await self.run_service.mark_running(run)
 
             full_content_parts: list[str] = []
+            total_input_tokens = 0
+            total_output_tokens = 0
             try:
                 async for event in self.engine.run_stream(
                     ctx,
@@ -145,6 +228,10 @@ class ChatService:
                     content_piece = event["payload"].get("content")
                     if content_piece and event["payload"].get("is_assistant_content"):
                         full_content_parts.append(str(content_piece))
+
+                    in_tok, out_tok = _extract_token_usage(event["payload"])
+                    total_input_tokens += in_tok
+                    total_output_tokens += out_tok
             except RuntimeExecutionError as exc:
                 await self.run_service.mark_failed(run, str(exc))
                 raise
@@ -160,6 +247,15 @@ class ChatService:
 
             await self.run_service.mark_completed(run, output)
 
+            await self.quota_service.record_usage(
+                run_id=run.id,
+                user_id=request.user_id,
+                groups=verified_groups,
+                model_id=model_id_for_quota,
+                input_tokens=total_input_tokens,
+                output_tokens=total_output_tokens,
+            )
+
             return {
                 "session_id": chat_session.id,
                 "run_id": run.id,
@@ -173,6 +269,12 @@ class ChatService:
         if isinstance(ctx, ResolvedTeamContext):
             # Pick a representative agent for session/run creation (DB requires an agent_id).
             representative_agent = ctx.member_contexts[0].agent
+            model_id_for_quota = representative_agent.model_id or ctx.agent_os.default_model_id
+
+            await self.quota_service.assert_within_quota(
+                user_id=request.user_id, groups=verified_groups, model_id=model_id_for_quota
+            )
+
             chat_session = await self._get_or_create_session(
                 request, ctx.agent_os.id, ctx.team.id, representative_agent.id
             )
@@ -201,6 +303,21 @@ class ChatService:
             )
             await self.run_service.mark_completed(run, output)
 
+            await self.quota_service.record_usage(
+                run_id=run.id,
+                user_id=request.user_id,
+                groups=verified_groups,
+                model_id=model_id_for_quota,
+                # run_team() (non-streaming) returns aggregated text only,
+                # not per-run metrics - token accounting for Team runs
+                # requires the streaming path (run_team_stream) to observe
+                # per-event metrics; recorded as 0/0 here rather than
+                # guessing, which only affects TOKENS/COST_USD-metric
+                # policies (REQUESTS-metric policies are unaffected).
+                input_tokens=0,
+                output_tokens=0,
+            )
+
             return {
                 "session_id": chat_session.id,
                 "run_id": run.id,
@@ -215,6 +332,12 @@ class ChatService:
             # Representative team/agent for DB records
             rep_team_ctx = ctx.team_contexts[0]
             representative_agent = rep_team_ctx.member_contexts[0].agent
+            model_id_for_quota = representative_agent.model_id or ctx.agent_os.default_model_id
+
+            await self.quota_service.assert_within_quota(
+                user_id=request.user_id, groups=verified_groups, model_id=model_id_for_quota
+            )
+
             chat_session = await self._get_or_create_session(
                 request, ctx.agent_os.id, rep_team_ctx.team.id, representative_agent.id
             )
@@ -231,6 +354,8 @@ class ChatService:
             await self.run_service.mark_running(run)
 
             full_content_parts: list[str] = []
+            total_input_tokens = 0
+            total_output_tokens = 0
             try:
                 async for event in self.engine.run_root_stream(
                     ctx,
@@ -244,6 +369,10 @@ class ChatService:
                     content_piece = event["payload"].get("content")
                     if content_piece and event["payload"].get("is_assistant_content"):
                         full_content_parts.append(str(content_piece))
+
+                    in_tok, out_tok = _extract_token_usage(event["payload"])
+                    total_input_tokens += in_tok
+                    total_output_tokens += out_tok
             except RuntimeExecutionError as exc:
                 await self.run_service.mark_failed(run, str(exc))
                 raise
@@ -258,6 +387,15 @@ class ChatService:
             )
 
             await self.run_service.mark_completed(run, output)
+
+            await self.quota_service.record_usage(
+                run_id=run.id,
+                user_id=request.user_id,
+                groups=verified_groups,
+                model_id=model_id_for_quota,
+                input_tokens=total_input_tokens,
+                output_tokens=total_output_tokens,
+            )
 
             return {
                 "session_id": chat_session.id,
@@ -312,11 +450,19 @@ class ChatService:
 
     async def handle_chat_stream(self, request: ChatRequest) -> AsyncIterator[dict[str, Any]]:
         """Streaming chat turn. Used by POST /api/v1/chat/stream (SSE)."""
+        verified_groups = self._resolve_identity(request)
+
         ctx = await self.engine.resolve_dispatch_context(request.agentOs, request.team)
 
         if isinstance(ctx, ResolvedRuntimeContext):
             selected_team = ctx.team
             selected_agent = ctx.agent
+            model_id_for_quota = selected_agent.model_id or ctx.agent_os.default_model_id
+
+            await self.quota_service.assert_within_quota(
+                user_id=request.user_id, groups=verified_groups, model_id=model_id_for_quota
+            )
+
             chat_session = await self._get_or_create_session(
                 request, ctx.agent_os.id, selected_team.id, selected_agent.id
             )
@@ -341,6 +487,8 @@ class ChatService:
             }
 
             full_content_parts: list[str] = []
+            total_input_tokens = 0
+            total_output_tokens = 0
             stream = self.engine.run_stream(
                 ctx,
                 request.message,
@@ -361,6 +509,10 @@ class ChatService:
                     content_piece = event["payload"].get("content")
                     if content_piece and event["payload"].get("is_assistant_content"):
                         full_content_parts.append(str(content_piece))
+
+                    in_tok, out_tok = _extract_token_usage(event["payload"])
+                    total_input_tokens += in_tok
+                    total_output_tokens += out_tok
 
                     agui_event = self.agui_interface.build_event(
                         event_name=event["event_type"],
@@ -399,6 +551,15 @@ class ChatService:
             await self.run_service.mark_completed(run, final_output)
             await self.session.commit()
 
+            await self.quota_service.record_usage(
+                run_id=run.id,
+                user_id=request.user_id,
+                groups=verified_groups,
+                model_id=model_id_for_quota,
+                input_tokens=total_input_tokens,
+                output_tokens=total_output_tokens,
+            )
+
             yield {
                 "event_type": "agent_completed",
                 "run_id": run.id,
@@ -408,6 +569,12 @@ class ChatService:
 
         elif isinstance(ctx, ResolvedTeamContext):
             representative_agent = ctx.member_contexts[0].agent
+            model_id_for_quota = representative_agent.model_id or ctx.agent_os.default_model_id
+
+            await self.quota_service.assert_within_quota(
+                user_id=request.user_id, groups=verified_groups, model_id=model_id_for_quota
+            )
+
             chat_session = await self._get_or_create_session(
                 request, ctx.agent_os.id, ctx.team.id, representative_agent.id
             )
@@ -432,6 +599,8 @@ class ChatService:
             }
 
             full_content_parts: list[str] = []
+            total_input_tokens = 0
+            total_output_tokens = 0
             stream = self.engine.run_team_stream(
                 ctx,
                 request.message,
@@ -452,6 +621,10 @@ class ChatService:
                     content_piece = event["payload"].get("content")
                     if content_piece and event["payload"].get("is_assistant_content"):
                         full_content_parts.append(str(content_piece))
+
+                    in_tok, out_tok = _extract_token_usage(event["payload"])
+                    total_input_tokens += in_tok
+                    total_output_tokens += out_tok
 
                     agui_event = self.agui_interface.build_event(
                         event_name=event["event_type"],
@@ -490,6 +663,15 @@ class ChatService:
             await self.run_service.mark_completed(run, final_output)
             await self.session.commit()
 
+            await self.quota_service.record_usage(
+                run_id=run.id,
+                user_id=request.user_id,
+                groups=verified_groups,
+                model_id=model_id_for_quota,
+                input_tokens=total_input_tokens,
+                output_tokens=total_output_tokens,
+            )
+
             yield {
                 "event_type": "agent_completed",
                 "run_id": run.id,
@@ -500,6 +682,12 @@ class ChatService:
         elif isinstance(ctx, ResolvedRootContext):
             rep_team_ctx = ctx.team_contexts[0]
             representative_agent = rep_team_ctx.member_contexts[0].agent
+            model_id_for_quota = representative_agent.model_id or ctx.agent_os.default_model_id
+
+            await self.quota_service.assert_within_quota(
+                user_id=request.user_id, groups=verified_groups, model_id=model_id_for_quota
+            )
+
             chat_session = await self._get_or_create_session(
                 request, ctx.agent_os.id, rep_team_ctx.team.id, representative_agent.id
             )
@@ -524,6 +712,8 @@ class ChatService:
             }
 
             full_content_parts: list[str] = []
+            total_input_tokens = 0
+            total_output_tokens = 0
             stream = self.engine.run_root_stream(
                 ctx,
                 request.message,
@@ -544,6 +734,10 @@ class ChatService:
                     content_piece = event["payload"].get("content")
                     if content_piece and event["payload"].get("is_assistant_content"):
                         full_content_parts.append(str(content_piece))
+
+                    in_tok, out_tok = _extract_token_usage(event["payload"])
+                    total_input_tokens += in_tok
+                    total_output_tokens += out_tok
 
                     agui_event = self.agui_interface.build_event(
                         event_name=event["event_type"],
@@ -582,13 +776,21 @@ class ChatService:
             await self.run_service.mark_completed(run, final_output)
             await self.session.commit()
 
+            await self.quota_service.record_usage(
+                run_id=run.id,
+                user_id=request.user_id,
+                groups=verified_groups,
+                model_id=model_id_for_quota,
+                input_tokens=total_input_tokens,
+                output_tokens=total_output_tokens,
+            )
+
             yield {
                 "event_type": "agent_completed",
                 "run_id": run.id,
                 "session_id": chat_session.id,
                 "data": {"message": final_output},
             }
-
 
     def _merge_content_parts(self, content_parts: list[str]) -> str:
         merged = ""

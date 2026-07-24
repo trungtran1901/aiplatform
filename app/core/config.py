@@ -93,7 +93,9 @@ class Settings(BaseSettings):
     # --- Keycloak (token issuer reference only; runtime does not validate) ---
     KEYCLOAK_ISSUER_URL: str | None = None
     KEYCLOAK_REALM: str | None = None
-
+    KEYCLOAK_JWKS_URL: str | None = None
+    KEYCLOAK_AUDIENCE: str | None = None
+    AUTH_MODE: Literal["trust_client_user_id", "keycloak_required"] = "trust_client_user_id"
     # --- Observability ---
     OTEL_ENABLED: bool = False
     OTEL_EXPORTER_OTLP_ENDPOINT: str | None = None
@@ -116,7 +118,8 @@ class Settings(BaseSettings):
     FEATURE_EVENT_ENGINE: bool = False
     FEATURE_UI_SKILLS: bool = False
     FEATURE_UI_ACTIONS: bool = False
-
+    FEATURE_KEYCLOAK_AUTH: bool = False
+    FEATURE_QUOTA_MANAGEMENT: bool = False
     @property
     def is_production(self) -> bool:
         return self.APP_ENV == "production"

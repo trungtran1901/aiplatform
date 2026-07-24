@@ -14,6 +14,7 @@ from app.api.v1 import (
     models,
     observations,
     prompts,
+    quota,
     runs,
     runtime_events,
     sessions,
@@ -41,7 +42,7 @@ api_router.include_router(runs.router)
 api_router.include_router(memories.router)
 api_router.include_router(workflows.router)
 api_router.include_router(workflow_runs.router)
-api_router.include_router(attachments.router) 
+api_router.include_router(attachments.router)
 # --- AgentX Runtime v2 (all feature-flagged, additive) ---
 api_router.include_router(ui_metadata.router)
 api_router.include_router(business_objects.router)
@@ -50,3 +51,4 @@ api_router.include_router(runtime_events.router)
 api_router.include_router(execution_plans.router)
 api_router.include_router(workflow_schedules.router)
 api_router.include_router(workflow_webhooks.router)
+api_router.include_router(quota.router)  # MỚI - Quota Management (flagged FEATURE_QUOTA_MANAGEMENT)

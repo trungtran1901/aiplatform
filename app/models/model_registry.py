@@ -25,7 +25,8 @@ class ModelRegistry(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     temperature: Mapped[float] = mapped_column(default=0.7, nullable=False)
     max_tokens: Mapped[int] = mapped_column(Integer, default=4096, nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
-
+    cost_per_1k_input_tokens: Mapped[float | None] = mapped_column(nullable=True)
+    cost_per_1k_output_tokens: Mapped[float | None] = mapped_column(nullable=True)
     # Custom endpoint support - all optional, only used when set.
     base_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     api_key: Mapped[str | None] = mapped_column(Text, nullable=True)

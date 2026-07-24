@@ -25,6 +25,8 @@ from starlette.responses import Response
 from app.core.auth_context import PropagatedAuth, set_propagated_auth
 from app.core.config import get_settings
 from app.core.logging import correlation_id_var
+from app.core.identity import verify_bearer_token
+from app.core.identity_context import set_verified_identity
 
 
 class RequestContextMiddleware(BaseHTTPMiddleware):
@@ -41,6 +43,12 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
             correlation_id=correlation_id,
         )
         set_propagated_auth(auth)
+
+        # Verified identity is SEPARATE from PropagatedAuth (which is
+        # forwarded verbatim, never inspected) - see app/core/identity.py.
+        # Fails open to None; never blocks the request itself.
+        identity = await verify_bearer_token(auth.authorization)
+        set_verified_identity(identity)
 
         response = await call_next(request)
         response.headers[settings.FORWARD_HEADER_CORRELATION_ID] = correlation_id

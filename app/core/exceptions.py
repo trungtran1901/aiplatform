@@ -12,7 +12,15 @@ class AgnoRuntimeError(Exception):
         super().__init__(message)
         self.message = message
         self.details = details or {}
+        
+class QuotaExceededError(AgnoRuntimeError):
+    """Raised when a caller has exhausted their configured quota
+    (tokens/requests/cost) for the current period. This is a metering
+    outcome, not an authorization decision - see
+    app/services/quota_service.py module docstring."""
 
+    http_status = 429
+    error_code = "quota_exceeded"
 
 class NotFoundError(AgnoRuntimeError):
     http_status = 404
