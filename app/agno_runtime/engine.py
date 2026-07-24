@@ -73,6 +73,34 @@ present - see app/businessobjects/service.py and app/uiaction/service.py):
     additional `ui_action_plan` event at the end of the stream when any
     actions were proposed.
 
+  - QUOTA METRICS: token usage accounting for streamed runs.
+
+    IMPORTANT (agno==1.8.4): unlike some other Agno versions, the
+    RunResponseEvent subclasses emitted during a streaming `arun(...,
+    stream=True)` call (RunResponseContentEvent, ToolCallStartedEvent,
+    ToolCallCompletedEvent, RunResponseCompletedEvent, and their Team
+    equivalents) do NOT carry a `metrics` attribute in this version.
+    Aggregated token usage only exists on the final `RunResponse` /
+    `TeamRunResponse` object itself, reachable as `agno_agent.run_response`
+    (or `agno_team.run_response` / `agno_root_team.run_response`) once
+    the stream has been fully consumed.
+
+    Earlier drafts of this module read `getattr(event, "metrics", None)`
+    inside the per-event loop; on agno 1.8.4 that is always None, which
+    is why QuotaService silently recorded 0 tokens for every streamed
+    run. The fix: never look for `metrics` on individual stream events.
+    Instead, after the `async for event in stream:` loop finishes (i.e.
+    the run is fully done), read `metrics` once from the agent/team's
+    own `run_response` attribute and emit a single extra
+    `agent_completed` event carrying `payload["metrics"]`. This engine
+    makes no decision about *what* to do with the metrics beyond
+    surfacing them; QuotaService is solely responsible for enforcement/
+    recording. ChatService's consumer should treat this as the single
+    source of truth for a streamed run's usage and must not also sum
+    metrics off of other events (there are none carrying metrics
+    anymore, but this note is here so nobody re-adds per-event reading
+    without re-checking the installed agno version first).
+
 Hierarchical dispatch (AgentOS -> Team -> Agent), added on top of the
 flow above:
 
@@ -186,6 +214,77 @@ _ASSISTANT_CONTENT_TEAM_EVENT_NAMES = frozenset({"TeamRunResponseContent"})
 _ASSISTANT_CONTENT_EVENT_NAMES = frozenset({"RunResponseContent"})
 
 
+def _metrics_to_dict(metrics: Any) -> dict[str, Any] | None:
+    """Normalizes whatever shape Agno's `run_response.metrics` happens to
+    be (plain dict, a dataclass-like metrics object, or something
+    exposing `.to_dict()` / `.model_dump()`) into a plain dict so
+    downstream code (ChatService._extract_token_usage) can read it
+    uniformly without needing to know the Agno-internal type. Returns
+    None - never raises - for anything it can't confidently convert,
+    since token accounting must never crash an otherwise-successful run.
+    """
+    if metrics is None:
+        return None
+    if isinstance(metrics, dict):
+        return metrics
+    to_dict = getattr(metrics, "to_dict", None)
+    if callable(to_dict):
+        try:
+            result = to_dict()
+            if isinstance(result, dict):
+                return result
+        except Exception:  # noqa: BLE001
+            pass
+    model_dump = getattr(metrics, "model_dump", None)
+    if callable(model_dump):
+        try:
+            result = model_dump()
+            if isinstance(result, dict):
+                return result
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        return dict(vars(metrics))
+    except TypeError:
+        return None
+
+
+def _extract_final_metrics(agno_obj: Any) -> dict[str, Any] | None:
+    """Reads aggregated token-usage metrics off a finished Agno Agent or
+    Team run.
+
+    agno==1.8.4 does NOT stamp `.metrics` on individual streaming events
+    (RunResponseContentEvent, ToolCallCompletedEvent,
+    RunResponseCompletedEvent, or their Team-prefixed equivalents) - only
+    the final `RunResponse` / `TeamRunResponse` object carries it, as
+    `agno_obj.run_response.metrics`. This helper is the single place that
+    reads it, so if a future agno upgrade moves/renames the field, only
+    this function needs to change.
+    """
+    run_response = getattr(agno_obj, "run_response", None)
+    if run_response is None:
+        return None
+    return _metrics_to_dict(getattr(run_response, "metrics", None))
+
+
+def _build_stream_payload(event_name: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Normalize stream payloads so only assistant text deltas surface as content.
+
+    Agno can emit completion events that carry the same final answer text as a
+    non-assistant event (for example TeamRunCompleted). Those payloads should
+    not be forwarded to the UI as if they were new assistant content, because
+    that causes duplicated or repeated output when routing through a root team.
+    """
+    normalized_payload = dict(payload)
+    is_assistant_content = event_name in _ASSISTANT_CONTENT_EVENT_NAMES or event_name in _ASSISTANT_CONTENT_TEAM_EVENT_NAMES
+    normalized_payload["is_assistant_content"] = is_assistant_content
+
+    if not is_assistant_content:
+        normalized_payload.pop("content", None)
+
+    return normalized_payload
+
+
 def _dedupe_self_concatenated(text: str) -> str:
     """Some Agno completion events (observed on TeamRunCompleted in
     coordinate mode after a leader relays a single delegated member's
@@ -211,24 +310,6 @@ def _dedupe_self_concatenated(text: str) -> str:
     if first_half and first_half == second_half:
         return first_half
     return text
-
-
-def _build_stream_payload(event_name: str, payload: dict[str, Any]) -> dict[str, Any]:
-    """Normalize stream payloads so only assistant text deltas surface as content.
-
-    Agno can emit completion events that carry the same final answer text as a
-    non-assistant event (for example TeamRunCompleted). Those payloads should
-    not be forwarded to the UI as if they were new assistant content, because
-    that causes duplicated or repeated output when routing through a root team.
-    """
-    normalized_payload = dict(payload)
-    is_assistant_content = event_name in _ASSISTANT_CONTENT_EVENT_NAMES or event_name in _ASSISTANT_CONTENT_TEAM_EVENT_NAMES
-    normalized_payload["is_assistant_content"] = is_assistant_content
-
-    if not is_assistant_content:
-        normalized_payload.pop("content", None)
-
-    return normalized_payload
 
 
 class ResolvedRuntimeContext:
@@ -671,6 +752,7 @@ class AgnoRuntimeEngine:
     ) -> AsyncIterator[dict[str, Any]]:
         self._reset_ui_action_collectors()
         mcp_session = self.tool_builder.build(ctx.effective_capabilities)
+        agno_agent: AgnoAgent | None = None
         try:
             async with mcp_session as session:
                 agno_agent = await self._build_agno_agent(
@@ -694,11 +776,31 @@ class AgnoRuntimeEngine:
                     if tool_calls:
                         payload["tools"] = tool_calls
 
+                    # NOTE (agno==1.8.4): stream events never carry
+                    # `.metrics` in this version - only the final
+                    # `agno_agent.run_response` does. Do NOT read
+                    # `event.metrics` here; see `_extract_final_metrics`
+                    # and the module docstring's QUOTA METRICS note.
+
                     yield {"event_type": mapped_type, "payload": payload}
         except Exception as exc:  # noqa: BLE001
             logger.error("agno_run_stream_failed", error=str(exc), agent_code=ctx.agent.code)
             yield {"event_type": "error", "payload": {"error": str(exc)}}
             raise RuntimeExecutionError(f"Agno agent streaming execution failed: {exc}") from exc
+
+        # --- QUOTA FIX (agno 1.8.4 correct source): the stream is fully
+        # consumed at this point, so `agno_agent.run_response` now holds
+        # the aggregated RunResponse for the whole turn. Read metrics
+        # once here and surface them as a single extra event -
+        # ChatService._extract_token_usage should treat this as the sole
+        # source of truth for a streamed run's usage, not sum metrics
+        # across events (no other event carries any). ---
+        metrics_dict = _extract_final_metrics(agno_agent)
+        if metrics_dict:
+            yield {
+                "event_type": "agent_completed",
+                "payload": {"is_assistant_content": False, "metrics": metrics_dict},
+            }
 
         self.last_ui_action_plan = self._aggregate_ui_action_plan(run_id=session_id)
         if self.last_ui_action_plan.actions:
@@ -790,6 +892,7 @@ class AgnoRuntimeEngine:
     ) -> AsyncIterator[dict[str, Any]]:
         own_team_id = str(ctx.team.id)
         self._reset_ui_action_collectors()
+        agno_team: AgnoTeam | None = None
         async with AsyncExitStack() as exit_stack:
             try:
                 agno_team = await self._build_agno_team(
@@ -819,11 +922,25 @@ class AgnoRuntimeEngine:
                     if tool_calls:
                         payload["tools"] = tool_calls
 
+                    # NOTE (agno==1.8.4): same as run_stream() above -
+                    # Team stream events never carry `.metrics` either;
+                    # read it once from `agno_team.run_response` after
+                    # the loop instead (see below).
+
                     yield {"event_type": mapped_type, "payload": payload}
             except Exception as exc:  # noqa: BLE001
                 logger.error("agno_team_run_stream_failed", error=str(exc), team_code=ctx.team.code)
                 yield {"event_type": "error", "payload": {"error": str(exc)}}
                 raise RuntimeExecutionError(f"Agno team streaming execution failed: {exc}") from exc
+
+        # --- QUOTA FIX (agno 1.8.4 correct source): read aggregated
+        # metrics once from the finished Team's own run_response. ---
+        metrics_dict = _extract_final_metrics(agno_team)
+        if metrics_dict:
+            yield {
+                "event_type": "agent_completed",
+                "payload": {"is_assistant_content": False, "metrics": metrics_dict},
+            }
 
         self.last_ui_action_plan = self._aggregate_ui_action_plan(run_id=session_id)
         if self.last_ui_action_plan.actions:
@@ -916,6 +1033,7 @@ class AgnoRuntimeEngine:
     ) -> AsyncIterator[dict[str, Any]]:
         own_team_id = f"root-{ctx.agent_os.id}"
         self._reset_ui_action_collectors()
+        agno_root_team: AgnoTeam | None = None
         async with AsyncExitStack() as exit_stack:
             try:
                 agno_root_team = await self._build_agno_root_team(
@@ -945,11 +1063,24 @@ class AgnoRuntimeEngine:
                     if tool_calls:
                         payload["tools"] = tool_calls
 
+                    # NOTE (agno==1.8.4): same as the other two streaming
+                    # paths above - no per-event `.metrics`; read it once
+                    # from `agno_root_team.run_response` after the loop.
+
                     yield {"event_type": mapped_type, "payload": payload}
             except Exception as exc:  # noqa: BLE001
                 logger.error("agno_root_run_stream_failed", error=str(exc), agent_os_code=ctx.agent_os.code)
                 yield {"event_type": "error", "payload": {"error": str(exc)}}
                 raise RuntimeExecutionError(f"Agno root team streaming execution failed: {exc}") from exc
+
+        # --- QUOTA FIX (agno 1.8.4 correct source): read aggregated
+        # metrics once from the finished Root Team's own run_response. ---
+        metrics_dict = _extract_final_metrics(agno_root_team)
+        if metrics_dict:
+            yield {
+                "event_type": "agent_completed",
+                "payload": {"is_assistant_content": False, "metrics": metrics_dict},
+            }
 
         self.last_ui_action_plan = self._aggregate_ui_action_plan(run_id=session_id)
         if self.last_ui_action_plan.actions:

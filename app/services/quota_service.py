@@ -24,6 +24,34 @@ docs/Architecture.md#1) - a quota-exceeded response is a metering
 outcome ("you've used what was allocated to you"), not an RBAC
 decision. It is safe for this to live in Agno Runtime the same way
 run_control.py's cancellation logic does.
+
+PERSISTENCE FIX (added): `record_usage()` used to call
+`self.usage_repo.create(...)` without ever committing the resulting
+QuotaUsageEvent row, and without rolling back on failure. Two
+consequences, both silent:
+
+  - Redis counters (incremented separately, right below, over a plain
+    network call with no relation to the SQLAlchemy session) always
+    looked correct, while the durable Postgres audit row never actually
+    persisted - nothing in this class or its caller (ChatService) ever
+    issued a matching `session.commit()` for this specific write, so it
+    relied entirely on whatever the request-scoped session dependency
+    happens to do when the request/generator ends (rollback/close in
+    most FastAPI session-dependency patterns, unless every write commits
+    itself).
+  - If `usage_repo.create()` ever raised (e.g. a constraint violation),
+    the old `except Exception: log-and-swallow` block left the
+    SQLAlchemy session in a *failed transaction* state without calling
+    `rollback()` - every subsequent statement on that session (including
+    completely unrelated commits done later in the same request) would
+    then also fail, silently compounding the original problem.
+
+This method now commits immediately after a successful insert, and
+explicitly rolls back on failure so the session is left usable for
+whatever runs after it - this method owns its own transaction boundary
+rather than assuming the caller will handle it, since it is documented
+as best-effort and must never leave the session poisoned for the rest
+of the request.
 """
 from __future__ import annotations
 
@@ -187,10 +215,23 @@ class QuotaService:
 
         Best-effort by design (mirrors ObservationEngineService.record):
         a failure here must never fail the chat turn that already
-        completed successfully - errors are logged, not raised.
+        completed successfully - errors are logged, not raised. But
+        "best-effort" only covers *tolerating* failure, not *silently
+        never persisting on success* - this method now owns its own
+        commit for the Postgres write (see module docstring
+        "PERSISTENCE FIX"), instead of assuming ChatService (or whatever
+        else called this) will commit on its behalf afterwards.
         """
         settings = get_settings()
-        print("record_usage", user_id, str(run_id), input_tokens, output_tokens, cost_usd, settings.FEATURE_QUOTA_MANAGEMENT)
+        logger.debug(
+            "quota_record_usage_called",
+            user_id=user_id,
+            run_id=str(run_id) if run_id else None,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cost_usd=cost_usd,
+            feature_enabled=settings.FEATURE_QUOTA_MANAGEMENT,
+        )
         if not settings.FEATURE_QUOTA_MANAGEMENT or not user_id:
             return
 
@@ -204,9 +245,26 @@ class QuotaService:
                 output_tokens=output_tokens,
                 cost_usd=cost_usd,
             )
+            # --- PERSISTENCE FIX: this write was never committed before.
+            # Redis increments below are a separate, unrelated network
+            # call and always "worked" regardless of this bug, which is
+            # exactly why usage looked correct in Redis but the durable
+            # QuotaUsageEvent audit row never actually landed in
+            # Postgres - nothing upstream committed it either. ---
+            await self.session.commit()
         except Exception as exc:  # noqa: BLE001
-            print("quota_usage_event_write_failed", user_id, str(run_id), str(exc))
-            logger.error("quota_usage_event_write_failed", user_id=user_id, run_id=str(run_id), error=str(exc))
+            # --- PERSISTENCE FIX: must roll back on failure. Without
+            # this, a failed insert leaves the session in an aborted
+            # transaction state; every later statement on this same
+            # session (including unrelated commits elsewhere in the
+            # request) would then also start failing, silently. ---
+            await self.session.rollback()
+            logger.exception(
+                "quota_usage_event_write_failed",
+                user_id=user_id,
+                run_id=str(run_id) if run_id else None,
+                error=str(exc),
+            )
 
         try:
             policies = await self._select_effective_policies(user_id=user_id, groups=groups, model_id=model_id)

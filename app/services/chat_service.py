@@ -51,9 +51,40 @@ Actual usage is recorded (`QuotaService.record_usage`) once a run
 completes successfully, from whatever token metrics Agno's response
 exposes - this is best-effort by design (see QuotaService) and never
 allowed to fail an otherwise-successful chat turn.
+
+COST CALCULATION (added): `record_usage()` accepts an optional
+`cost_usd`, but nothing in this file used to compute one - `cost_usd`
+was always sent as `None`, silently making every QuotaMetric.COST_USD
+policy inert and leaving `quota_usage_events.cost_usd` permanently NULL.
+`_compute_cost_usd()` below resolves the ModelRegistry entry actually
+used for the turn and, if it has `cost_per_1k_input_tokens` /
+`cost_per_1k_output_tokens` configured, computes
+    cost_usd = (input_tokens/1000)*cost_in + (output_tokens/1000)*cost_out
+Returns None (not 0.0) when the model has no cost configured at all, so
+QuotaService can keep distinguishing "no cost data available" from
+"this turn genuinely cost $0" - see app/services/quota_service.py.
+Like token extraction, this is best-effort and never raises: a missing/
+disabled ModelRegistry entry at this late stage (the run already
+succeeded) simply yields cost_usd=None rather than failing the turn.
+
+TOKEN EXTRACTION FIX (agno==1.8.4): `_extract_token_usage()` below used
+to read `metrics["input_tokens"]` / `metrics["output_tokens"]` as plain
+scalars. On agno 1.8.4, `RunResponse.metrics` is produced by
+`Agent.aggregate_metrics_from_messages()`, which returns a dict whose
+values are LISTS - one entry per assistant Message that carried metrics
+during the run (i.e. one entry per model call / tool-loop iteration),
+e.g. `{"input_tokens": [120, 45], "output_tokens": [30, 12], ...}`.
+Treating a list as a scalar (`int(metrics["input_tokens"])`) raises
+TypeError, which the old code silently swallowed and fell through to
+`(0, 0)` - this was the actual root cause of quota always recording
+zero tokens, even once app/agno_runtime/engine.py was fixed to read
+`run_response.metrics` from the correct place. `_extract_token_usage`
+now sums list-shaped values (and still accepts plain scalars, for
+forward/backward compatibility with other Agno versions/shapes).
 """
 from __future__ import annotations
 
+import uuid
 from typing import Any, AsyncIterator
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -67,6 +98,7 @@ from app.core.logging import get_logger
 from app.core.run_control import clear_cancel, is_cancelled
 from app.models.run import EventType
 from app.models.session import MessageRole
+from app.repositories.model_repository import ModelRegistryRepository
 from app.repositories.session_repository import ChatMessageRepository, ChatSessionRepository
 from app.schemas.chat import ChatRequest
 from app.services.quota_service import QuotaService
@@ -75,18 +107,69 @@ from app.services.run_service import RunTrackingService
 logger = get_logger(__name__)
 
 
+def _sum_metric_field(container: Any, *keys: str) -> int:
+    """Reads the first matching key out of `container` (dict or object
+    with attributes) and returns it as an int, summing across the list
+    if the value is list/tuple-shaped.
+
+    agno==1.8.4's `RunResponse.metrics` stores each metric as a LIST of
+    per-message values rather than a single aggregated scalar (see
+    `Agent.aggregate_metrics_from_messages`), so this must sum rather
+    than cast directly. Still accepts a plain scalar for forward/
+    backward compatibility with other Agno versions/shapes. Never
+    raises - returns 0 for anything it can't confidently interpret,
+    since token accounting must never break an otherwise-successful
+    chat turn.
+    """
+    for key in keys:
+        if isinstance(container, dict):
+            value = container.get(key)
+        else:
+            value = getattr(container, key, None)
+
+        if value is None:
+            continue
+
+        if isinstance(value, (list, tuple)):
+            try:
+                return int(sum(v for v in value if v is not None))
+            except (TypeError, ValueError):
+                continue
+
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+
+    return 0
+
+
 def _extract_token_usage(resp_or_event: Any) -> tuple[int, int]:
     """Best-effort extraction of (input_tokens, output_tokens) from an
-    Agno RunResponse / stream event's `.metrics`. Agno's `.metrics` can
-    be a plain dict or a small metrics object depending on version/path
-    (single-agent vs Team run), so both shapes are handled. Returns
-    (0, 0) - never raises - when metrics are absent or in an
+    Agno RunResponse / stream event's `.metrics`, summed across every
+    assistant message counted in this run. Agno's `.metrics` can be a
+    plain dict or a small metrics object depending on version/path
+    (single-agent vs Team run), and on agno 1.8.4 each field is itself a
+    LIST of per-message values rather than a pre-summed scalar (see
+    `_sum_metric_field` / module docstring "TOKEN EXTRACTION FIX").
+    Returns (0, 0) - never raises - when metrics are absent or in an
     unrecognized shape, since token accounting must never break an
     otherwise-successful chat turn.
 
+    NOTE: `resp_or_event` here is always the normalized `event["payload"]`
+    dict produced by AgnoRuntimeEngine's streaming methods
+    (run_stream/run_team_stream/run_root_stream). Those methods surface
+    Agno's final aggregated `run_response.metrics` (read once, after the
+    stream is fully consumed) as `payload["metrics"]` on a single
+    trailing `agent_completed` event - see app/agno_runtime/
+    engine.py::_extract_final_metrics. No other event in the stream
+    carries `metrics` in agno 1.8.4, so this function only needs to find
+    a non-None value once per run.
+
     NOTE: verify the exact field names against the Agno version actually
     pinned in requirements.txt before relying on this for billing-grade
-    accuracy - field names have moved between Agno releases.
+    accuracy - field names (and whether values are scalars or lists)
+    have moved between Agno releases.
     """
     metrics = getattr(resp_or_event, "metrics", None)
     if metrics is None and isinstance(resp_or_event, dict):
@@ -94,17 +177,10 @@ def _extract_token_usage(resp_or_event: Any) -> tuple[int, int]:
     if metrics is None:
         return 0, 0
 
-    if isinstance(metrics, dict):
-        input_tokens = metrics.get("input_tokens") or metrics.get("prompt_tokens") or 0
-        output_tokens = metrics.get("output_tokens") or metrics.get("completion_tokens") or 0
-    else:
-        input_tokens = getattr(metrics, "input_tokens", None) or getattr(metrics, "prompt_tokens", 0) or 0
-        output_tokens = getattr(metrics, "output_tokens", None) or getattr(metrics, "completion_tokens", 0) or 0
+    input_tokens = _sum_metric_field(metrics, "input_tokens", "prompt_tokens")
+    output_tokens = _sum_metric_field(metrics, "output_tokens", "completion_tokens")
 
-    try:
-        return int(input_tokens or 0), int(output_tokens or 0)
-    except (TypeError, ValueError):
-        return 0, 0
+    return input_tokens, output_tokens
 
 
 class ChatService:
@@ -116,6 +192,7 @@ class ChatService:
         self.engine = AgnoRuntimeEngine(session)
         self.agui_interface = AgnoAguiInterface()
         self.quota_service = QuotaService(session)
+        self.model_repo = ModelRegistryRepository(session)
 
     def _resolve_identity(self, request: ChatRequest) -> list[str]:
         """Overwrites request.user_id in place with the effective
@@ -131,6 +208,39 @@ class ChatService:
         )
         request.user_id = effective_user_id
         return verified_groups
+
+    async def _compute_cost_usd(
+        self, model_id: uuid.UUID | None, *, input_tokens: int, output_tokens: int
+    ) -> float | None:
+        """Resolves `model_id`'s ModelRegistry row and computes the cost
+        of this turn from its configured per-1k-token prices. Returns
+        None (never 0.0) when:
+          - model_id is None,
+          - the ModelRegistry entry can't be found (e.g. deleted since
+            the run started), or
+          - neither cost_per_1k_input_tokens nor
+            cost_per_1k_output_tokens is configured on it.
+        This lets QuotaService keep distinguishing "no pricing data" from
+        "this call was free" - see module docstring. Never raises: a
+        lookup failure here must not fail an otherwise-successful chat
+        turn, so any error is logged and treated as "no cost data".
+        """
+        if model_id is None:
+            return None
+        try:
+            entry = await self.model_repo.get(model_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("quota_cost_model_lookup_failed", model_id=str(model_id), error=str(exc))
+            return None
+
+        if entry is None:
+            return None
+        if entry.cost_per_1k_input_tokens is None and entry.cost_per_1k_output_tokens is None:
+            return None
+
+        cost_in = entry.cost_per_1k_input_tokens or 0.0
+        cost_out = entry.cost_per_1k_output_tokens or 0.0
+        return (input_tokens / 1000.0) * cost_in + (output_tokens / 1000.0) * cost_out
 
     async def _get_or_create_session(self, request: ChatRequest, agent_os_id, team_id, agent_id):
         if request.session_id:
@@ -247,6 +357,9 @@ class ChatService:
 
             await self.run_service.mark_completed(run, output)
 
+            cost_usd = await self._compute_cost_usd(
+                model_id_for_quota, input_tokens=total_input_tokens, output_tokens=total_output_tokens
+            )
             await self.quota_service.record_usage(
                 run_id=run.id,
                 user_id=request.user_id,
@@ -254,6 +367,7 @@ class ChatService:
                 model_id=model_id_for_quota,
                 input_tokens=total_input_tokens,
                 output_tokens=total_output_tokens,
+                cost_usd=cost_usd,
             )
 
             return {
@@ -303,19 +417,25 @@ class ChatService:
             )
             await self.run_service.mark_completed(run, output)
 
+            # run_team() (non-streaming) returns aggregated text only, not
+            # per-run metrics - token accounting for Team runs requires the
+            # streaming path (run_team_stream) to observe per-event
+            # metrics; recorded as 0/0 here rather than guessing, so
+            # cost_usd is computed from those same zeros (i.e. None, since
+            # 0 tokens against any non-zero price is still a real, if
+            # uninteresting, $0.00 - _compute_cost_usd only returns None
+            # when the model has no pricing configured at all). This only
+            # affects TOKENS/COST_USD-metric policies (REQUESTS-metric
+            # policies are unaffected).
+            cost_usd = await self._compute_cost_usd(model_id_for_quota, input_tokens=0, output_tokens=0)
             await self.quota_service.record_usage(
                 run_id=run.id,
                 user_id=request.user_id,
                 groups=verified_groups,
                 model_id=model_id_for_quota,
-                # run_team() (non-streaming) returns aggregated text only,
-                # not per-run metrics - token accounting for Team runs
-                # requires the streaming path (run_team_stream) to observe
-                # per-event metrics; recorded as 0/0 here rather than
-                # guessing, which only affects TOKENS/COST_USD-metric
-                # policies (REQUESTS-metric policies are unaffected).
                 input_tokens=0,
                 output_tokens=0,
+                cost_usd=cost_usd,
             )
 
             return {
@@ -388,6 +508,9 @@ class ChatService:
 
             await self.run_service.mark_completed(run, output)
 
+            cost_usd = await self._compute_cost_usd(
+                model_id_for_quota, input_tokens=total_input_tokens, output_tokens=total_output_tokens
+            )
             await self.quota_service.record_usage(
                 run_id=run.id,
                 user_id=request.user_id,
@@ -395,6 +518,7 @@ class ChatService:
                 model_id=model_id_for_quota,
                 input_tokens=total_input_tokens,
                 output_tokens=total_output_tokens,
+                cost_usd=cost_usd,
             )
 
             return {
@@ -551,6 +675,9 @@ class ChatService:
             await self.run_service.mark_completed(run, final_output)
             await self.session.commit()
 
+            cost_usd = await self._compute_cost_usd(
+                model_id_for_quota, input_tokens=total_input_tokens, output_tokens=total_output_tokens
+            )
             await self.quota_service.record_usage(
                 run_id=run.id,
                 user_id=request.user_id,
@@ -558,6 +685,7 @@ class ChatService:
                 model_id=model_id_for_quota,
                 input_tokens=total_input_tokens,
                 output_tokens=total_output_tokens,
+                cost_usd=cost_usd,
             )
 
             yield {
@@ -663,6 +791,9 @@ class ChatService:
             await self.run_service.mark_completed(run, final_output)
             await self.session.commit()
 
+            cost_usd = await self._compute_cost_usd(
+                model_id_for_quota, input_tokens=total_input_tokens, output_tokens=total_output_tokens
+            )
             await self.quota_service.record_usage(
                 run_id=run.id,
                 user_id=request.user_id,
@@ -670,6 +801,7 @@ class ChatService:
                 model_id=model_id_for_quota,
                 input_tokens=total_input_tokens,
                 output_tokens=total_output_tokens,
+                cost_usd=cost_usd,
             )
 
             yield {
@@ -776,6 +908,9 @@ class ChatService:
             await self.run_service.mark_completed(run, final_output)
             await self.session.commit()
 
+            cost_usd = await self._compute_cost_usd(
+                model_id_for_quota, input_tokens=total_input_tokens, output_tokens=total_output_tokens
+            )
             await self.quota_service.record_usage(
                 run_id=run.id,
                 user_id=request.user_id,
@@ -783,6 +918,7 @@ class ChatService:
                 model_id=model_id_for_quota,
                 input_tokens=total_input_tokens,
                 output_tokens=total_output_tokens,
+                cost_usd=cost_usd,
             )
 
             yield {
